@@ -6,11 +6,12 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from .db import connect, init_db
-from .logic import (HOUR, ConflictError, ValidationError, ingest, parse_csv,
-                    utc_iso)
+from .logic import (HOUR, ConflictError, ValidationError, ingest,
+                    list_replacements, parse_csv, register_replacement, utc_iso)
 
 
 @asynccontextmanager
@@ -21,13 +22,16 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Park Energy Backfill API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Receives backfilled cumulative meter readings (CSV), keeps exactly one "
         "copy of identical retransmissions, rejects batches that contradict "
         "stored readings, and derives billable hourly kWh for the billing team. "
-        "Upload samples via the file picker below, then query /readings and "
-        "/hourly-usage."),
+        "Meter swap work orders can be registered per meter: the hour ending at "
+        "the swap instant uses the old meter's last code, the hour starting there "
+        "uses the new meter's initial code, even when the gateway skipped that "
+        "hour. Upload samples via the file picker below, then query /readings "
+        "and /hourly-usage."),
     lifespan=lifespan,
 )
 
@@ -69,12 +73,86 @@ class BatchOut(BaseModel):
     rows_deduplicated: int
 
 
+class ReplacementIn(BaseModel):
+    meter_id: str = Field(..., min_length=1, max_length=128,
+                          description="Meter identifier the gateway keeps reporting under")
+    replacement_second: int = Field(
+        ..., ge=0,
+        description="UTC hour-aligned second of the swap instant, e.g. 1793509200")
+    old_meter_last_kwh: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="Last cumulative code of the old meter")
+    new_meter_initial_kwh: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="First cumulative code of the new meter")
+
+
+class ReplacementOut(BaseModel):
+    meter_id: str
+    replacement_second: int
+    replacement_utc: str
+    old_meter_last_kwh: float
+    new_meter_initial_kwh: float
+    registered_at: str
+
+
+class ReplacementRegistered(ReplacementOut):
+    created: bool
+    hourly_usage_updated: int
+
+
+# ---------- meter swap work orders ----------
+
+@app.post("/meter-replacements", response_model=ReplacementRegistered,
+          status_code=201,
+          summary="Register a meter swap work order (one per meter)",
+          responses={
+              200: {"description": "Identical work order was already registered; nothing changed"},
+              409: {"description": "A different work order exists for this meter, or a stored "
+                                   "reading at the swap instant contradicts both codes"},
+              422: {"description": "Invalid work order; nothing was saved"},
+          })
+def create_meter_replacement(body: ReplacementIn):
+    """Register the UTC swap hour plus the old meter's last code and the new
+    meter's initial code.
+
+    - one swap point per meter; an identical retransmission returns 200 with
+      `created=false`, a different one is rejected with 409
+    - the hour ending at the swap instant is billed with `old_meter_last_kwh`,
+      the hour starting there with `new_meter_initial_kwh`, even if the gateway
+      never reported that hour
+    - the registration and the recomputed hours commit together; raw readings
+      are left untouched
+    """
+    if body.replacement_second % HOUR != 0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"replacement_second must be aligned to a UTC hour, "
+                   f"got {body.replacement_second}")
+    try:
+        result = register_replacement(body.meter_id, body.replacement_second,
+                                      body.old_meter_last_kwh,
+                                      body.new_meter_initial_kwh)
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if not result["created"]:
+        return JSONResponse(status_code=200, content=result)
+    return result
+
+
+@app.get("/meter-replacements", response_model=list[ReplacementOut],
+         summary="List registered meter swap work orders")
+def get_meter_replacements():
+    return list_replacements()
+
+
 # ---------- ingest ----------
 
 @app.post("/batches", response_model=IngestResponse, status_code=201,
           summary="Upload a CSV batch of cumulative readings",
           responses={
-              409: {"description": "Batch contradicts stored readings; nothing was saved"},
+              409: {"description": "Batch contradicts stored readings or a registered "
+                                   "meter swap; nothing was saved"},
               415: {"description": "Unsupported content type"},
               422: {"description": "CSV failed validation; nothing was saved"},
           })
@@ -83,7 +161,12 @@ async def create_batch(request: Request,
                            default=None,
                            description="CSV file with columns meter_id,utc_second,kwh")):
     """Accept the CSV either as a multipart file upload (Swagger file picker)
-    or as a raw `text/csv` request body."""
+    or as a raw `text/csv` request body.
+
+    For a meter with a registered swap, a row at the swap instant must carry
+    either the old meter's last code or the new meter's initial code. Both are
+    accepted — even together in one batch — and recorded without touching any
+    previously stored raw reading. Other values reject the whole batch."""
     text = await _extract_csv_text(request, file)
 
     try:
@@ -93,6 +176,8 @@ async def create_batch(request: Request,
 
     try:
         return ingest(rows)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except ConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 

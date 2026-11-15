@@ -74,4 +74,81 @@ curl -s "$API_A/readings?meter_id=meter-north-03" | jq -r '.[] | "  \(.utc_time)
 echo "hourly usage of meter-north-03 (consistent with the final readings):"
 query_hours "$API_B" "meter-north-03"
 
+say "7. meter swap: api-a <- batch7 (00,01,02,03,04 with the 02:00 reading still on the old code)"
+post_batch "$API_A" "$SAMPLES/batch7_swap_before_registration.csv"
+echo "meter-south-04 before the work order (02:00 looks like a rollback 903 -> 43):"
+query_hours "$API_A" "meter-south-04"
+
+say "8. api-b <- work order for meter-south-04 (swap at 02:00, old last 903, new initial 40)"
+rm -f /tmp/demo_wo_1.json /tmp/demo_wo_2.json
+curl -s -o /tmp/demo_wo_1.json -w '  HTTP %{http_code}\n' \
+  -X POST "$API_B/meter-replacements" -H 'content-type: application/json' \
+  --data-binary @"$SAMPLES/work_order_swap.json"
+jq . /tmp/demo_wo_1.json | sed 's/^/  /'
+echo "hourly usage after registration (hour 02 now starts with the new code 40 -> 43):"
+query_hours "$API_A" "meter-south-04"
+echo "raw readings (unchanged: the stored 02:00 row is not rewritten):"
+curl -s "$API_A/readings?meter_id=meter-south-04&from_second=$T0&to_second=$T5" |
+  jq -r '.[] | "  \(.utc_time)  kwh=\(.kwh)"'
+
+say "9. api-a <- identical work order again (200, created=false, no duplicate registration)"
+curl -s -o /tmp/demo_wo_2.json -w '  HTTP %{http_code}\n' \
+  -X POST "$API_A/meter-replacements" -H 'content-type: application/json' \
+  --data-binary @"$SAMPLES/work_order_swap.json"
+jq . /tmp/demo_wo_2.json | sed 's/^/  /'
+
+say "10. both instances <- batch8 at the same time (old and new codes for the swap hour)"
+curl -s -o /tmp/demo_swap_a.json -w '  api-a HTTP %{http_code}\n' \
+  -F "file=@$SAMPLES/batch8_swap_retransmit_both_codes.csv;type=text/csv" "$API_A/batches" &
+PID_A=$!
+curl -s -o /tmp/demo_swap_b.json -w '  api-b HTTP %{http_code}\n' \
+  -F "file=@$SAMPLES/batch8_swap_retransmit_both_codes.csv;type=text/csv" "$API_B/batches" &
+PID_B=$!
+wait "$PID_A" "$PID_B"
+echo "  api-a response:"; jq . /tmp/demo_swap_a.json | sed 's/^/  /'
+echo "  api-b response:"; jq . /tmp/demo_swap_b.json | sed 's/^/  /'
+echo "raw readings (still one row per second; nothing rewritten):"
+curl -s "$API_A/readings?meter_id=meter-south-04&from_second=$T0&to_second=$T5" |
+  jq -r '.[] | "  \(.utc_time)  kwh=\(.kwh)"'
+echo "hourly usage (hour 01 keeps the old code, hour 02 the new code):"
+query_hours "$API_B" "meter-south-04"
+
+say "11. api-b <- batch9 (a third value at the swap hour: whole batch rejected)"
+post_batch "$API_B" "$SAMPLES/batch9_swap_conflicting_value.csv"
+
+say "12. api-a <- batch7b + work order for meter-south-06 (gateway never reported the swap hour)"
+post_batch "$API_A" "$SAMPLES/batch7b_swap_hour_skipped.csv"
+echo "before the work order (01:00 and 02:00 are a gap):"
+query_hours "$API_A" "meter-south-06"
+curl -s -o /tmp/demo_wo_skipped.json -w '  work order HTTP %{http_code}\n' \
+  -X POST "$API_A/meter-replacements" -H 'content-type: application/json' \
+  --data-binary @"$SAMPLES/work_order_swap_skipped.json"
+echo "after the work order (02:00 is never stored, yet both hours are billable):"
+query_hours "$API_A" "meter-south-06"
+echo "raw readings of meter-south-06 (no synthetic row at 02:00):"
+curl -s "$API_A/readings?meter_id=meter-south-06&from_second=$T0&to_second=$T5" |
+  jq -r '.[] | "  \(.utc_time)  kwh=\(.kwh)"'
+
+say "13. concurrent conflicting work orders on the two instances (exactly one wins)"
+rm -f /tmp/demo_wo_a.json /tmp/demo_wo_b.json
+jq -c '.old_meter_last_kwh = 904.0 | .meter_id = "meter-south-05"' \
+  "$SAMPLES/work_order_swap.json" > /tmp/demo_wo_alt_1.json
+jq -c '.old_meter_last_kwh = 905.0 | .meter_id = "meter-south-05"' \
+  "$SAMPLES/work_order_swap.json" > /tmp/demo_wo_alt_2.json
+curl -s -o /tmp/demo_wo_a.json -w '  api-a HTTP %{http_code}\n' \
+  -X POST "$API_A/meter-replacements" -H 'content-type: application/json' \
+  --data-binary @/tmp/demo_wo_alt_1.json &
+PID_A=$!
+curl -s -o /tmp/demo_wo_b.json -w '  api-b HTTP %{http_code}\n' \
+  -X POST "$API_B/meter-replacements" -H 'content-type: application/json' \
+  --data-binary @/tmp/demo_wo_alt_2.json &
+PID_B=$!
+wait "$PID_A" "$PID_B"
+echo "  rejected side:"
+for f in /tmp/demo_wo_a.json /tmp/demo_wo_b.json; do
+  jq -r 'select(.detail) | "    " + .detail' "$f" || true
+done
+echo "registered work orders:"
+curl -s "$API_A/meter-replacements" | jq . | sed 's/^/  /'
+
 say "demo finished"

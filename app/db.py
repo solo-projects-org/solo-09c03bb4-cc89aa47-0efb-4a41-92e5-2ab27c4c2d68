@@ -39,6 +39,17 @@ CREATE TABLE IF NOT EXISTS hourly_usage (
     reason     TEXT NOT NULL,                 -- ok | gap | rollback
     PRIMARY KEY (meter_id, hour_start)
 );
+
+-- One meter swap work order per meter. The gateway keeps reporting under the
+-- old meter_id, so this is the only place the old/new meter codes live. Raw
+-- readings are never rewritten or synthesized from this row.
+CREATE TABLE IF NOT EXISTS meter_replacements (
+    meter_id             TEXT PRIMARY KEY,
+    replacement_second   INTEGER NOT NULL,    -- UTC hour-aligned swap instant
+    old_meter_last_kwh   REAL NOT NULL,       -- last cumulative code of old meter
+    new_meter_initial_kwh REAL NOT NULL,      -- first cumulative code of new meter
+    registered_at        TEXT NOT NULL        -- ISO-8601 UTC
+);
 """
 
 BUSY_TIMEOUT_MS = 30_000
